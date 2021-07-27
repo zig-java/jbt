@@ -54,12 +54,18 @@ pub const CompileStep = struct {
 
     fn make(step: *std.build.Step) !void {
         const self = @fieldParentPtr(CompileStep, "step", step);
+        try self.build();
+    }
+
+    fn build(self: *Self) !void {
         const builder = self.builder;
 
         var java_args = std.ArrayList([]const u8).init(builder.allocator);
         defer java_args.deinit();
 
         try java_args.append("javac");
+
+        try java_args.append("-verbose");
 
         try java_args.append("-d");
         try java_args.append(self.output_path);
@@ -74,7 +80,39 @@ pub const CompileStep = struct {
             try java_args.append(class);
         }
 
-        try builder.spawnChild(java_args.items);
+        const child = std.ChildProcess.init(java_args.items, self.builder.allocator) catch unreachable;
+        defer child.deinit();
+
+        child.stderr_behavior = .Pipe;
+        child.env_map = self.builder.env_map;
+
+        child.spawn() catch |err| {
+            std.log.warn("Unable to spawn {s}: {s}\n", .{ java_args.items[0], @errorName(err) });
+            return err;
+        };
+
+        var progress = std.Progress{};
+        const root_node = progress.start(self.builder.fmt("{s}", .{self.name}), 0) catch |err| switch (err) {
+            // TODO still run tests in this case
+            error.TimerUnsupported => @panic("timer unsupported"),
+        };
+
+        var reader = child.stderr.?.reader();
+        var buf: [256]u8 = undefined;
+        while (try reader.readUntilDelimiterOrEof(&buf, '\n')) |line| {
+            if (std.mem.startsWith(u8, line, "[")) {
+                var test_node = root_node.start(line, 0);
+                test_node.activate();
+                progress.refresh();
+                test_node.end();
+                // root_node.setEstimatedTotalItems();
+                // root_node.completeOne();
+            } else {
+                try std.io.getStdErr().writer().print("{s}\n", .{line});
+            }
+        }
+        _ = try child.wait();
+        root_node.end();
     }
 };
 
